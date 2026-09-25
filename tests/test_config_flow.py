@@ -6,12 +6,14 @@ from homeassistant import config_entries, setup
 from homeassistant.core import HomeAssistant
 import pytest
 
-from custom_components.watersmart.client import AuthenticationError
+from custom_components.watersmart.client import AuthenticationError, Requires2FAError
 from custom_components.watersmart.const import DOMAIN
 
 
 async def test_successful_flow(hass: HomeAssistant, mock_watersmart_client):
-    """Test we get the form."""
+    """Test we get the form and create entry directly when no 2FA is needed."""
+
+    mock_watersmart_client.async_get_account_number.return_value = "123456"
 
     await setup.async_setup_component(hass, "persistent_notification", {})
     result = await hass.config_entries.flow.async_init(
@@ -44,6 +46,87 @@ async def test_successful_flow(hass: HomeAssistant, mock_watersmart_client):
     assert len(mock_setup_entry.mock_calls) == 1
 
 
+async def test_successful_2fa_flow(hass: HomeAssistant, mock_watersmart_client):
+    """Test 2FA flow returns 2fa step, accepts code, and saves cookies."""
+    # First login triggers 2FA, verify_2fa works, second scrape gets account number
+    mock_watersmart_client.async_get_account_number.side_effect = [
+        Requires2FAError(),
+        "123456",
+    ]
+    mock_watersmart_client.async_verify_2fa.return_value = {
+        "auth_session": "saved_cookie"
+    }
+
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "host": "test",
+            "username": "test@home-assistant.io",
+            "password": "Passw0rd",
+        },
+    )
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "2fa"
+
+    with patch(
+        "custom_components.watersmart.async_setup_entry",
+        return_value=True,
+    ) as mock_setup_entry:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"code": "123456"},
+        )
+
+    assert result["type"] == "create_entry"
+    assert result["title"] == "test (test@home-assistant.io)"
+    assert result["data"] == {
+        "host": "test",
+        "username": "test@home-assistant.io",
+        "password": "Passw0rd",
+        "cookies": {"auth_session": "saved_cookie"},
+    }
+
+    await hass.async_block_till_done()
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+async def test_2fa_error_invalid_auth(hass: HomeAssistant, mock_watersmart_client):
+    """Test 2FA flow handles invalid auth correctly."""
+    mock_watersmart_client.async_get_account_number.side_effect = Requires2FAError()
+    mock_watersmart_client.async_verify_2fa.side_effect = AuthenticationError(
+        ["invalid code"]
+    )
+
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "host": "test",
+            "username": "test@home-assistant.io",
+            "password": "Passw0rd",
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"code": "wrong_code"},
+    )
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "2fa"
+    assert result["errors"] == {"base": "invalid_auth"}
+
+
 @pytest.mark.parametrize(
     ("side_effect", "expected_errors"),
     [
@@ -70,7 +153,7 @@ async def test_error(
     side_effect,
     expected_errors,
 ):
-    """Test we get the form."""
+    """Test we get the form with errors on initial authentication."""
 
     mock_watersmart_client.async_get_account_number.return_value = None
     mock_watersmart_client.async_get_account_number.side_effect = side_effect
@@ -102,3 +185,68 @@ async def test_error(
     assert configured_result["errors"] == expected_errors
     await hass.async_block_till_done()
     assert len(mock_setup_entry.mock_calls) == 0
+
+
+async def test_2fa_error_unknown(hass: HomeAssistant, mock_watersmart_client):
+    """Test 2FA flow handles unexpected exceptions correctly."""
+    mock_watersmart_client.async_get_account_number.side_effect = Requires2FAError()
+    mock_watersmart_client.async_verify_2fa.side_effect = Exception(
+        "Something went wrong"
+    )
+
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "host": "test",
+            "username": "test@home-assistant.io",
+            "password": "Passw0rd",
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"code": "123456"},
+    )
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "2fa"
+    assert result["errors"] == {"base": "unknown"}
+
+
+async def test_2fa_error_no_account(hass: HomeAssistant, mock_watersmart_client):
+    """Test 2FA flow handles missing account number after successful 2FA code."""
+    mock_watersmart_client.async_get_account_number.side_effect = [
+        Requires2FAError(),
+        None,
+    ]
+    mock_watersmart_client.async_verify_2fa.return_value = {
+        "auth_session": "saved_cookie"
+    }
+
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "host": "test",
+            "username": "test@home-assistant.io",
+            "password": "Passw0rd",
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"code": "123456"},
+    )
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "2fa"
+    assert result["errors"] == {"base": "invalid_auth"}

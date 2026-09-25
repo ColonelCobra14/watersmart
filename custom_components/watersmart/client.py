@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import contextlib
 import datetime as dt
 import functools
 import re
@@ -10,6 +11,7 @@ from typing import Any, TypedDict, cast
 
 import aiohttp
 from bs4 import BeautifulSoup, PageElement
+from yarl import URL
 
 # Account number format will vary between municipality, so
 # match on a string of non-whitespace characters.
@@ -59,6 +61,10 @@ class ScrapeError(Exception):
     """Scrape Error."""
 
 
+class Requires2FAError(Exception):
+    """Error to indicate 2FA code is required."""
+
+
 class UsageHistoryPayload(TypedDict):
     """UsageHistoryPayload class."""
 
@@ -89,6 +95,7 @@ class WaterSmartClient:
         username: str,
         password: str,
         session: aiohttp.ClientSession = None,
+        cookies: dict[str, str] | None = None,
     ) -> None:
         """Initialize."""
         self._hostname = hostname
@@ -97,6 +104,10 @@ class WaterSmartClient:
         self._session = session or aiohttp.ClientSession()
         self._account_number: str | None = None
         self._authenticated_at: dt.datetime | None = None
+
+        if cookies:
+            domain_url = URL(f"https://{self._hostname}.watersmart.com")
+            self._session.cookie_jar.update_cookies(cookies, response_url=domain_url)
 
     @_authenticated
     async def async_get_account_number(self) -> str | None:
@@ -136,8 +147,15 @@ class WaterSmartClient:
     async def _authenticate(self) -> None:
         session = self._session
         hostname = self._hostname
+
+        with contextlib.suppress(aiohttp.ClientError):
+            await session.get(
+                f"https://{hostname}.watersmart.com/index.php/logout/login",
+                headers=_DEFAULT_HEADERS,
+            )
+
         login_response = await session.post(
-            f"https://{hostname}.watersmart.com/index.php/welcome/login?forceEmail=1",
+            f"https://{hostname}.watersmart.com/index.php/logout/login?forceEmail=1",
             data={
                 "token": "",
                 "email": self._username,
@@ -148,6 +166,12 @@ class WaterSmartClient:
         login_response_text = await login_response.text()
         soup = BeautifulSoup(login_response_text, "html.parser")
 
+        if (
+            "verification code" in login_response_text.lower()
+            or "two-factor" in login_response_text.lower()
+        ):
+            raise Requires2FAError
+
         login_refresh_token_node = soup.find("input", {"name": "loginRefreshToken"})
         login_refresh_token = (
             login_refresh_token_node.get("value", "")
@@ -157,7 +181,7 @@ class WaterSmartClient:
 
         if login_refresh_token:
             login_response = await session.post(
-                f"https://{hostname}.watersmart.com/index.php/welcome/login?forceEmail=1",
+                f"https://{hostname}.watersmart.com/index.php/logout/login?forceEmail=1",
                 data={
                     "token": "",
                     "loginRefreshToken": login_refresh_token,
@@ -192,6 +216,40 @@ class WaterSmartClient:
             raise InvalidAccountNumberError("invalid account number: " + account_number)
 
         self._account_number = account_number
+
+    async def async_verify_2fa(self, code: str) -> dict[str, str]:
+        """Submit 2FA code and extract cookies.
+
+        Returns:
+            The extracted session cookies.
+
+        Raises:
+            AuthenticationError: If the 2FA code is rejected.
+        """
+        session = self._session
+        hostname = self._hostname
+
+        verify_response = await session.post(
+            f"https://{hostname}.watersmart.com/index.php/welcome/verify",
+            data={"verificationCode": code},
+            headers=_DEFAULT_HEADERS,
+        )
+
+        text = await verify_response.text()
+
+        soup = BeautifulSoup(text, "html.parser")
+        errors = [err.text.strip() for err in soup.select(".error-message")]
+        errors = [err for err in errors if err]
+
+        if errors:
+            raise AuthenticationError(errors)
+
+        # Extract cookies from the session jar to save in Home Assistant
+        cookies = {}
+        for cookie in session.cookie_jar:
+            cookies[cookie.key] = cookie.value
+
+        return cookies
 
 
 def _assert_node(node: PageElement, message: str) -> PageElement:
